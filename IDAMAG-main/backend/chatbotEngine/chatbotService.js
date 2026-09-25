@@ -27,57 +27,50 @@ function scoreRow(row, tokens) {
   return tokens.reduce((score, token) => score + (body.includes(token) ? 1 : 0), 0);
 }
 
-// Exact vacancy counts must be computed from all loaded rows, not the excerpt
-// sent to Ollama. Only count when both the unit and status columns are clear.
+// Use the worksheet's filled flag for exact position totals. STATUS can contain
+// hiring process labels such as "FOR PUBLICATION" and is not a vacancy flag.
 function exactVacancyCount(reportData, question) {
-  const match = String(question).match(/\b(?:how many|count|number of|total)\b[\s\S]*\b(?:unfilled|vacant|vacancies)\b[\s\S]*\b(?:in|for|at|under)\s+([a-z][a-z0-9-]*)\b/i);
-  if (!match) return null;
-  const unit = match[1].toLowerCase();
-  const citations = [];
-  let count = 0;
+  const request = String(question);
+  if (!/\b(?:how many|count|number of|total)\b/i.test(request) ||
+      !/\b(?:positions?|posts?|plantilla items?|jobs?)\b/i.test(request) ||
+      !/\b(?:filled|unfilled|vacant|vacancies)\b/i.test(request)) return null;
+
+  const unitMatch = request.match(/\b(?:in|for|at|under)\s+([a-z][a-z0-9-]*)\b/i);
+  const unit = unitMatch?.[1]?.toUpperCase() || null;
+  const wantsFilled = /\bfilled\b/i.test(request);
+  const wantsUnfilled = /\b(?:unfilled|vacant|vacancies)\b/i.test(request);
+  let filled = 0;
+  let unfilled = 0;
   let inspected = 0;
-  let matchingUnitRows = 0;
-  let recognizedStatusRows = 0;
+  const matched = [];
   for (const [name, sheet] of Object.entries(reportData || {})) {
     if (sheet?.error) return `I can't verify the exact count: worksheet "${name}" could not be read.`;
     const rows = Array.isArray(sheet) ? sheet : Array.isArray(sheet?.rows) ? sheet.rows : [];
     if (!rows.length) continue;
     const columns = Object.keys(rows[0] || {});
-    const unitColumns = columns.filter((key) => /\b(?:office|division|unit|department|section|assigned to)\b/i.test(key));
-    const statusColumns = columns.filter((key) => /\b(?:status|vacancy|occupancy|remarks|availability|unfilled)\b/i.test(key));
-    if (!unitColumns.length || !statusColumns.length) {
-      return `I can't verify the exact count because worksheet "${name}" does not have clear unit and vacancy status columns.`;
-    }
-    const previousUnit = Object.fromEntries(unitColumns.map((key) => [key, ""]));
-    rows.forEach((row, index) => {
-      for (const key of unitColumns) {
-        const value = String(row[key] ?? "").trim();
-        if (value) previousUnit[key] = value;
-      }
+    const statusKey = columns.find((key) => /^filled\s*\(\s*y\s*\/\s*n\s*\)$/i.test(key.trim()));
+    const itemKey = columns.find((key) => /\bplantilla item no\b/i.test(key));
+    const unitKeys = columns.filter((key) => /^(?:office|division|unit|department|section)$/i.test(key.trim()));
+    if (!statusKey || !itemKey || (unit && !unitKeys.length))
+      return `I can't verify the exact count: worksheet "${name}" is missing its plantilla item, FILLED(Y/N), or unit column.`;
+    for (const [index, row] of rows.entries()) {
+      if (!String(row?.[itemKey] ?? "").trim()) continue;
+      if (unit && !unitKeys.some((key) => String(row[key] ?? "").trim().toUpperCase() === unit)) continue;
       inspected++;
-      const belongsToUnit = unitColumns.some((key) =>
-        new RegExp(`(^|[^a-z0-9])${unit}([^a-z0-9]|$)`, "i").test(previousUnit[key])
-      );
-      if (!belongsToUnit) return;
-      matchingUnitRows++;
-      if (statusColumns.some((key) => /\b(?:unfilled|vacant|vacancy|filled|occupied|unoccupied)\b/i.test(String(row[key] ?? "")))) {
-        recognizedStatusRows++;
-      }
-      const vacant = statusColumns.some((key) => {
-        const value = String(row[key] ?? "").trim().toLowerCase();
-        return /\b(?:unfilled|vacant|unoccupied|vacancy)\b/.test(value) &&
-          !/\b(?:not vacant|no vacancy|no vacancies)\b/.test(value);
-      });
-      if (vacant) {
-        count++;
-        citations.push(`${name} row ${index + 2}`);
-      }
-    });
+      const status = String(row[statusKey] ?? "").trim().toUpperCase();
+      if (status === "FILLED") filled++;
+      else if (status === "UNFILLED") unfilled++;
+      else return `I can't verify the exact count: ${name} row ${index + 2} has an unrecognized FILLED(Y/N) value.`;
+      if (unit && (status === "UNFILLED" || wantsFilled)) matched.push(`${name} row ${index + 2}`);
+    }
   }
-  if (!inspected) return "I can't verify the exact count because no worksheet rows were readable.";
-  if (!matchingUnitRows) return `I can't verify the exact count because no rows were identified as belonging to ${unit.toUpperCase()}.`;
-  if (!recognizedStatusRows) return `I can't verify the exact count because vacancy statuses for ${unit.toUpperCase()} were not recognizable.`;
-  return `I counted ${count} unfilled position${count === 1 ? "" : "s"} in ${unit.toUpperCase()} across ${inspected} worksheet rows.${citations.length ? ` Matching rows: ${citations.slice(0, 30).join(", ")}${citations.length > 30 ? ` (and ${citations.length - 30} more)` : ""}.` : ""}`;
+  if (!inspected) return `I can't verify the exact count: no position rows${unit ? ` for ${unit}` : ""} were found.`;
+  const scope = unit ? ` in ${unit}` : "";
+  const countText = wantsFilled && wantsUnfilled
+    ? `${filled} filled and ${unfilled} unfilled positions`
+    : wantsUnfilled ? `${unfilled} unfilled position${unfilled === 1 ? "" : "s"}`
+      : `${filled} filled position${filled === 1 ? "" : "s"}`;
+  return `Across ${inspected} plantilla items${scope}: ${countText}.${unit && matched.length <= 10 ? ` Matching worksheet rows: ${matched.join(", ")}.` : ""}`;
 }
 
 function buildEvidence(reportData, question) {
