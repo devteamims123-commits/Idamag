@@ -27,6 +27,59 @@ function scoreRow(row, tokens) {
   return tokens.reduce((score, token) => score + (body.includes(token) ? 1 : 0), 0);
 }
 
+// Exact vacancy counts must be computed from all loaded rows, not the excerpt
+// sent to Ollama. Only count when both the unit and status columns are clear.
+function exactVacancyCount(reportData, question) {
+  const match = String(question).match(/\b(?:how many|count|number of|total)\b[\s\S]*\b(?:unfilled|vacant|vacancies)\b[\s\S]*\b(?:in|for|at|under)\s+([a-z][a-z0-9-]*)\b/i);
+  if (!match) return null;
+  const unit = match[1].toLowerCase();
+  const citations = [];
+  let count = 0;
+  let inspected = 0;
+  let matchingUnitRows = 0;
+  let recognizedStatusRows = 0;
+  for (const [name, sheet] of Object.entries(reportData || {})) {
+    if (sheet?.error) return `I can't verify the exact count: worksheet "${name}" could not be read.`;
+    const rows = Array.isArray(sheet) ? sheet : Array.isArray(sheet?.rows) ? sheet.rows : [];
+    if (!rows.length) continue;
+    const columns = Object.keys(rows[0] || {});
+    const unitColumns = columns.filter((key) => /\b(?:office|division|unit|department|section|assigned to)\b/i.test(key));
+    const statusColumns = columns.filter((key) => /\b(?:status|vacancy|occupancy|remarks|availability|unfilled)\b/i.test(key));
+    if (!unitColumns.length || !statusColumns.length) {
+      return `I can't verify the exact count because worksheet "${name}" does not have clear unit and vacancy status columns.`;
+    }
+    const previousUnit = Object.fromEntries(unitColumns.map((key) => [key, ""]));
+    rows.forEach((row, index) => {
+      for (const key of unitColumns) {
+        const value = String(row[key] ?? "").trim();
+        if (value) previousUnit[key] = value;
+      }
+      inspected++;
+      const belongsToUnit = unitColumns.some((key) =>
+        new RegExp(`(^|[^a-z0-9])${unit}([^a-z0-9]|$)`, "i").test(previousUnit[key])
+      );
+      if (!belongsToUnit) return;
+      matchingUnitRows++;
+      if (statusColumns.some((key) => /\b(?:unfilled|vacant|vacancy|filled|occupied|unoccupied)\b/i.test(String(row[key] ?? "")))) {
+        recognizedStatusRows++;
+      }
+      const vacant = statusColumns.some((key) => {
+        const value = String(row[key] ?? "").trim().toLowerCase();
+        return /\b(?:unfilled|vacant|unoccupied|vacancy)\b/.test(value) &&
+          !/\b(?:not vacant|no vacancy|no vacancies)\b/.test(value);
+      });
+      if (vacant) {
+        count++;
+        citations.push(`${name} row ${index + 2}`);
+      }
+    });
+  }
+  if (!inspected) return "I can't verify the exact count because no worksheet rows were readable.";
+  if (!matchingUnitRows) return `I can't verify the exact count because no rows were identified as belonging to ${unit.toUpperCase()}.`;
+  if (!recognizedStatusRows) return `I can't verify the exact count because vacancy statuses for ${unit.toUpperCase()} were not recognizable.`;
+  return `I counted ${count} unfilled position${count === 1 ? "" : "s"} in ${unit.toUpperCase()} across ${inspected} worksheet rows.${citations.length ? ` Matching rows: ${citations.slice(0, 30).join(", ")}${citations.length > 30 ? ` (and ${citations.length - 30} more)` : ""}.` : ""}`;
+}
+
 function buildEvidence(reportData, question) {
   const tokens = [...new Set(String(question).toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) || [])]
     .filter((word) => !["what", "which", "where", "when", "with", "from", "that", "this", "total", "many", "show", "about"].includes(word))
@@ -59,6 +112,10 @@ function buildEvidence(reportData, question) {
 }
 
 async function answerQuestion(reportData, question, conversationKey) {
+  const exactAnswer = exactVacancyCount(reportData, question);
+  if (exactAnswer !== null) {
+    return { success: true, answer: exactAnswer };
+  }
   const apiKey = String(process.env.OLLAMA_API_KEY || "").trim();
   if (!apiKey) {
     throw Object.assign(new Error("OLLAMA_API_KEY is not configured on the backend."), { statusCode: 503 });
@@ -137,4 +194,4 @@ async function answerQuestion(reportData, question, conversationKey) {
   return { success: true, answer };
 }
 
-module.exports = { answerQuestion };
+module.exports = { answerQuestion, exactVacancyCount };
