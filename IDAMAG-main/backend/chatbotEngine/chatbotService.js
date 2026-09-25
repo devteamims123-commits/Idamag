@@ -43,6 +43,42 @@ function numberValue(value) {
   return /^-?\d+(?:\.\d+)?$/.test(normalized) ? Number(normalized) : null;
 }
 
+// Answer simple categorical counts directly from all cells. Column names and
+// category labels come from the selected worksheet and the user's question.
+function exactCategoryCount(reportData, question) {
+  if (!/\b(?:how many|count)\b/i.test(question)) return null;
+  const sheets = Object.entries(reportData || {});
+  if (sheets.length !== 1 || sheets[0][1]?.error) return null;
+  const [name, data] = sheets[0];
+  const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+  if (!rows.length) return null;
+  const columns = Object.keys(rows[0] || {});
+  const clean = (value) => String(value ?? '').trim().toLowerCase();
+  const terms = [...new Set(String(question).toLowerCase().match(/[\p{L}][\p{L}\p{N}-]*/gu) || [])]
+    .filter((word) => word.length > 2 && !['how', 'many', 'count', 'positions', 'position', 'records', 'record', 'are', 'and', 'the', 'for', 'from', 'that', 'this', 'what', 'with', 'all', 'in'].includes(word));
+  const scope = String(question).match(/\b(?:in|under|at)\s+([\p{L}][\p{L}\p{N}-]*)/iu)?.[1]?.toLowerCase();
+  let subset = rows;
+  let scopeKey = null;
+  if (scope) {
+    const choices = columns.map((key) => ({ key, count: rows.filter((row) => clean(row[key]) === scope).length }))
+      .filter((choice) => choice.count).sort((a, b) => b.count - a.count);
+    if (!choices.length) return null;
+    scopeKey = choices[0].key;
+    subset = rows.filter((row) => clean(row[scopeKey]) === scope);
+  }
+  const labels = terms.filter((term) => term !== scope && columns.some((key) =>
+    key !== scopeKey && subset.some((row) => clean(row[key]) === term)));
+  if (!labels.length || labels.length > 4) return null;
+  const ranked = columns.filter((key) => key !== scopeKey).map((key) => ({
+    key, matches: labels.filter((label) => subset.some((row) => clean(row[key]) === label)).length,
+    covered: subset.filter((row) => clean(row[key])).length,
+  })).filter((candidate) => candidate.matches === labels.length && candidate.covered === subset.length);
+  if (ranked.length !== 1) return null;
+  const key = ranked[0].key;
+  const totals = labels.map((label) => `${label} = ${subset.filter((row) => clean(row[key]) === label).length}`);
+  return `${name}: ${totals.join(', ')} (counted ${subset.length} rows${scopeKey ? ` where ${scopeKey} = ${scope}` : ''}; grouped by ${key}).`;
+}
+
 function executePlan(reportData, plan) {
   if (!plan || !Array.isArray(plan.queries) || plan.queries.length < 1 || plan.queries.length > 5)
     throw new Error("The question could not be mapped to a verifiable calculation.");
@@ -132,7 +168,7 @@ async function calculateFromAllRows(reportData, question, apiKey) {
     response = await fetch(ENDPOINT, {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: process.env.OLLAMA_MODEL || DEFAULT_MODEL, stream: false,
+      body: JSON.stringify({ model: process.env.OLLAMA_MODEL || DEFAULT_MODEL, stream: false, think: false,
         format: 'json', messages: [
           { role: 'system', content: `Translate the user's quantitative question into a calculation plan for the provided worksheets. Return JSON only: {"queries":[{"sheet":"exact worksheet name","operation":"count|sum|average|minimum|maximum","column":null,"groupBy":null,"filters":[{"column":"exact column name","operator":"equals|contains","value":"exact observed cell value"}]}]}. Use one grouped count for questions asking for categories such as filled and unfilled. For a filtered count, choose the column whose examples contain the requested value. Use only exact worksheet names, column names and category values from the schema. For count, column is null unless counting only nonempty values in that column. Use equals for categorical filters. When ambiguous or unsupported return {"queries":[]}. Do not include an answer or executable code.` },
           { role: 'user', content: `Question: ${String(question).slice(0, 1200)}\nWorksheet schema and example values: ${JSON.stringify(describeSheets(reportData)).slice(0, 24000)}` },
@@ -146,7 +182,12 @@ async function calculateFromAllRows(reportData, question, apiKey) {
   let plan;
   try {
     const result = await response.json();
-    plan = JSON.parse(result?.message?.content || '{}');
+    const content = result?.message?.content;
+    if (typeof content !== 'string' || !content.trim()) {
+      console.warn('Ollama calculation plan was empty:', { doneReason: result?.done_reason, thinkingPresent: Boolean(result?.message?.thinking) });
+      return "I couldn't determine a reliable calculation for that question.";
+    }
+    plan = JSON.parse(content.trim().replace(/^```(?:json)?\s*|\s*```$/g, ''));
   } catch {
     return "I couldn't determine a reliable calculation for that question.";
   }
@@ -155,6 +196,8 @@ async function calculateFromAllRows(reportData, question, apiKey) {
 }
 
 async function answerQuestion(reportData, question, conversationKey) {
+  const directAnswer = exactCategoryCount(reportData, question);
+  if (directAnswer) return { success: true, answer: directAnswer };
   const apiKey = String(process.env.OLLAMA_API_KEY || "").trim();
   if (!apiKey) {
     throw Object.assign(new Error("OLLAMA_API_KEY is not configured on the backend."), { statusCode: 503 });
@@ -237,4 +280,4 @@ async function answerQuestion(reportData, question, conversationKey) {
   return { success: true, answer };
 }
 
-module.exports = { answerQuestion, executePlan, describeSheets };
+module.exports = { answerQuestion, executePlan, describeSheets, exactCategoryCount };
