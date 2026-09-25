@@ -27,50 +27,68 @@ function scoreRow(row, tokens) {
   return tokens.reduce((score, token) => score + (body.includes(token) ? 1 : 0), 0);
 }
 
-// Use the worksheet's filled flag for exact position totals. STATUS can contain
-// hiring process labels such as "FOR PUBLICATION" and is not a vacancy flag.
-function exactVacancyCount(reportData, question) {
-  const request = String(question);
-  if (!/\b(?:how many|count|number of|total)\b/i.test(request) ||
-      !/\b(?:positions?|posts?|plantilla items?|jobs?)\b/i.test(request) ||
-      !/\b(?:filled|unfilled|vacant|vacancies)\b/i.test(request)) return null;
+function describeSheets(reportData) {
+  return Object.entries(reportData || {}).map(([name, data]) => {
+    const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+    const columns = [...new Set(rows.slice(0, 20).flatMap((row) => Object.keys(row || {})))];
+    return { name, error: data?.error || null, rowCount: rows.length,
+      columns: columns.map((column) => ({ name: column,
+        examples: [...new Set(rows.map((row) => String(row?.[column] ?? "").trim()).filter(Boolean))]
+          .slice(0, 8).map((value) => value.slice(0, 65)) })) };
+  });
+}
 
-  const unitMatch = request.match(/\b(?:in|for|at|under)\s+([a-z][a-z0-9-]*)\b/i);
-  const unit = unitMatch?.[1]?.toUpperCase() || null;
-  const wantsFilled = /\bfilled\b/i.test(request);
-  const wantsUnfilled = /\b(?:unfilled|vacant|vacancies)\b/i.test(request);
-  let filled = 0;
-  let unfilled = 0;
-  let inspected = 0;
-  const matched = [];
-  for (const [name, sheet] of Object.entries(reportData || {})) {
-    if (sheet?.error) return `I can't verify the exact count: worksheet "${name}" could not be read.`;
+function numberValue(value) {
+  const normalized = String(value ?? "").trim().replace(/,/g, "");
+  return /^-?\d+(?:\.\d+)?$/.test(normalized) ? Number(normalized) : null;
+}
+
+function executePlan(reportData, plan) {
+  if (!plan || !Array.isArray(plan.queries) || plan.queries.length < 1 || plan.queries.length > 5)
+    throw new Error("The question could not be mapped to a verifiable calculation.");
+  const answers = [];
+  for (const query of plan.queries) {
+    const sheet = reportData?.[query.sheet];
+    if (!sheet || sheet?.error) throw new Error("A required worksheet could not be read.");
     const rows = Array.isArray(sheet) ? sheet : Array.isArray(sheet?.rows) ? sheet.rows : [];
-    if (!rows.length) continue;
-    const columns = Object.keys(rows[0] || {});
-    const statusKey = columns.find((key) => /^filled\s*\(\s*y\s*\/\s*n\s*\)$/i.test(key.trim()));
-    const itemKey = columns.find((key) => /\bplantilla item no\b/i.test(key));
-    const unitKeys = columns.filter((key) => /^(?:office|division|unit|department|section)$/i.test(key.trim()));
-    if (!statusKey || !itemKey || (unit && !unitKeys.length))
-      return `I can't verify the exact count: worksheet "${name}" is missing its plantilla item, FILLED(Y/N), or unit column.`;
-    for (const [index, row] of rows.entries()) {
-      if (!String(row?.[itemKey] ?? "").trim()) continue;
-      if (unit && !unitKeys.some((key) => String(row[key] ?? "").trim().toUpperCase() === unit)) continue;
-      inspected++;
-      const status = String(row[statusKey] ?? "").trim().toUpperCase();
-      if (status === "FILLED") filled++;
-      else if (status === "UNFILLED") unfilled++;
-      else return `I can't verify the exact count: ${name} row ${index + 2} has an unrecognized FILLED(Y/N) value.`;
-      if (unit && (status === "UNFILLED" || wantsFilled)) matched.push(`${name} row ${index + 2}`);
+    if (!rows.length) throw new Error("A required worksheet has no readable rows.");
+    const columns = new Set(Object.keys(rows[0] || {}));
+    if (!['count', 'sum', 'average', 'minimum', 'maximum'].includes(query.operation) ||
+        (query.column && !columns.has(query.column)) ||
+        (query.groupBy && !columns.has(query.groupBy)) ||
+        !Array.isArray(query.filters) || query.filters.length > 6)
+      throw new Error("The selected calculation does not match the worksheet columns.");
+    for (const filter of query.filters) {
+      if (!columns.has(filter.column) || !['equals', 'contains'].includes(filter.operator) ||
+          typeof filter.value !== 'string' || filter.value.length > 150)
+        throw new Error("A filter does not match the worksheet columns.");
     }
+    const selected = rows.filter((row) => query.filters.every((filter) => {
+      const cell = String(row?.[filter.column] ?? "").trim().toLowerCase();
+      const value = filter.value.trim().toLowerCase();
+      return filter.operator === 'equals' ? cell === value : Boolean(value) && cell.includes(value);
+    })).filter((row) => !query.column || String(row?.[query.column] ?? "").trim());
+    const groups = new Map();
+    for (const row of selected) {
+      const group = query.groupBy ? String(row[query.groupBy] ?? "").trim() || "(blank)" : "all";
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group).push(row);
+    }
+    const results = [...groups.entries()].map(([group, items]) => {
+      if (query.operation === 'count') return { group, value: items.length };
+      if (!query.column) throw new Error("A numeric calculation needs a selected column.");
+      const values = items.map((item) => numberValue(item[query.column]));
+      if (values.some((value) => value === null)) throw new Error("Some selected values are not numbers.");
+      const sum = values.reduce((a, b) => a + b, 0);
+      const value = query.operation === 'sum' ? sum : query.operation === 'average' ? sum / values.length :
+        query.operation === 'minimum' ? Math.min(...values) : Math.max(...values);
+      return { group, value: Number(value.toFixed(4)) };
+    });
+    if (!query.groupBy && !results.length && query.operation === 'count') results.push({ group: 'all', value: 0 });
+    if (!results.length || results.length > 30) throw new Error("The answer could not be shown reliably from the selected rows.");
+    answers.push(`${query.sheet} (${selected.length} matching rows): ${query.operation}${query.column ? ` of ${query.column}` : ''}${query.groupBy ? ` by ${query.groupBy}` : ''}: ${results.map(({ group, value }) => `${group} = ${value}`).join(', ')}`);
   }
-  if (!inspected) return `I can't verify the exact count: no position rows${unit ? ` for ${unit}` : ""} were found.`;
-  const scope = unit ? ` in ${unit}` : "";
-  const countText = wantsFilled && wantsUnfilled
-    ? `${filled} filled and ${unfilled} unfilled positions`
-    : wantsUnfilled ? `${unfilled} unfilled position${unfilled === 1 ? "" : "s"}`
-      : `${filled} filled position${filled === 1 ? "" : "s"}`;
-  return `Across ${inspected} plantilla items${scope}: ${countText}.${unit && matched.length <= 10 ? ` Matching worksheet rows: ${matched.join(", ")}.` : ""}`;
+  return answers.join('\n');
 }
 
 function buildEvidence(reportData, question) {
@@ -104,14 +122,46 @@ function buildEvidence(reportData, question) {
   return sections.join("\n");
 }
 
-async function answerQuestion(reportData, question, conversationKey) {
-  const exactAnswer = exactVacancyCount(reportData, question);
-  if (exactAnswer !== null) {
-    return { success: true, answer: exactAnswer };
+async function calculateFromAllRows(reportData, question, apiKey) {
+  const broken = Object.entries(reportData || {}).filter(([, sheet]) => sheet?.error);
+  if (broken.length) return `I can't verify an exact answer because ${broken.map(([name]) => name).join(', ')} could not be read.`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), boundedInteger(process.env.OLLAMA_TIMEOUT_MS, 45000, 1000, 120000));
+  let response;
+  try {
+    response = await fetch(ENDPOINT, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: process.env.OLLAMA_MODEL || DEFAULT_MODEL, stream: false,
+        format: 'json', messages: [
+          { role: 'system', content: `Translate the user's quantitative question into a calculation plan for the provided worksheets. Return JSON only: {"queries":[{"sheet":"exact worksheet name","operation":"count|sum|average|minimum|maximum","column":null,"groupBy":null,"filters":[{"column":"exact column name","operator":"equals|contains","value":"exact observed cell value"}]}]}. Use one grouped count for questions asking for categories such as filled and unfilled. For a filtered count, choose the column whose examples contain the requested value. Use only exact worksheet names, column names and category values from the schema. For count, column is null unless counting only nonempty values in that column. Use equals for categorical filters. When ambiguous or unsupported return {"queries":[]}. Do not include an answer or executable code.` },
+          { role: 'user', content: `Question: ${String(question).slice(0, 1200)}\nWorksheet schema and example values: ${JSON.stringify(describeSheets(reportData)).slice(0, 24000)}` },
+        ] }), signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === 'AbortError') throw Object.assign(new Error('Ollama took too long to plan the calculation.'), { statusCode: 504 });
+    throw Object.assign(new Error('Could not connect to Ollama Cloud.'), { statusCode: 502 });
+  } finally { clearTimeout(timeout); }
+  if (!response.ok) throw Object.assign(new Error(`Ollama Cloud returned HTTP ${response.status}.`), { statusCode: 502 });
+  let plan;
+  try {
+    const result = await response.json();
+    plan = JSON.parse(result?.message?.content || '{}');
+  } catch {
+    return "I couldn't determine a reliable calculation for that question.";
   }
+  try { return executePlan(reportData, plan); }
+  catch (error) { return `I couldn't verify an exact answer: ${error.message}`; }
+}
+
+async function answerQuestion(reportData, question, conversationKey) {
   const apiKey = String(process.env.OLLAMA_API_KEY || "").trim();
   if (!apiKey) {
     throw Object.assign(new Error("OLLAMA_API_KEY is not configured on the backend."), { statusCode: 503 });
+  }
+
+  if (/\b(?:how many|count|total|sum|average|mean|minimum|maximum|highest|lowest)\b/i.test(String(question))) {
+    return { success: true, answer: await calculateFromAllRows(reportData, question, apiKey) };
   }
 
   const evidence = buildEvidence(reportData, question);
@@ -187,4 +237,4 @@ async function answerQuestion(reportData, question, conversationKey) {
   return { success: true, answer };
 }
 
-module.exports = { answerQuestion, exactVacancyCount };
+module.exports = { answerQuestion, executePlan, describeSheets };
