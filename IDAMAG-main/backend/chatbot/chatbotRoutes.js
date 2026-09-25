@@ -900,9 +900,8 @@ router.post("/chat-test", async (req, res) => {
   try {
     return res.json({
       success: true,
-      body: req.body,
-      groqKeyExists: Boolean(process.env.GROQ_API_KEY),
-      groqModel: process.env.GROQ_MODEL || null
+      ollamaKeyExists: Boolean(process.env.OLLAMA_API_KEY),
+      ollamaModel: process.env.OLLAMA_MODEL || "gemma4:31b"
     });
   } catch (error) {
     return res.status(500).json({
@@ -923,18 +922,18 @@ router.post("/chat", async (req, res) => {
   );
 
   console.log(
-    "Request body:",
-    req.body
+    "Request report ID:",
+    req.body?.reportId
   );
 
   console.log(
-    "GROQ_API_KEY available:",
-    Boolean(process.env.GROQ_API_KEY)
+    "OLLAMA_API_KEY available:",
+    Boolean(process.env.OLLAMA_API_KEY)
   );
 
   console.log(
-    "GROQ_MODEL:",
-    process.env.GROQ_MODEL || "NOT SET"
+    "OLLAMA_MODEL:",
+    process.env.OLLAMA_MODEL || "gemma4:31b"
   );
 
   console.log(
