@@ -43,6 +43,69 @@ function numberValue(value) {
   return /^-?\d+(?:\.\d+)?$/.test(normalized) ? Number(normalized) : null;
 }
 
+function normalizedHeader(value) {
+  return String(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// Find an explicit record identifier in the full data, or reuse the last
+// identified record for a short follow-up. Never carry it across reports.
+function findRecord(reportData, question, context) {
+  const q = String(question);
+  const identifiers = [...new Set(q.match(/\b(?=[a-z0-9-]*\d)[a-z0-9]+(?:-[a-z0-9]+)+\b/gi) || [])];
+  const rowNumber = q.match(/\b(?:source\s+)?row\s*(?:number|no\.?|#)\s*(\d+)\b/i)?.[1];
+  const candidates = [];
+  for (const [sheet, data] of Object.entries(reportData || {})) {
+    if (data?.error) continue;
+    const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+    if (!rows.length) continue;
+    const keys = Object.keys(rows[0] || {});
+    const rowKeys = keys.filter((key) => /(?:^| )row (?:number|no)(?:$| )/.test(normalizedHeader(key)));
+    for (const [index, row] of rows.entries()) {
+      for (const key of keys) {
+        const value = String(row[key] ?? '').trim();
+        if (!value) continue;
+        if (identifiers.some((id) => id.toLowerCase() === value.toLowerCase()) ||
+            (rowNumber && rowKeys.includes(key) && value === rowNumber)) {
+          candidates.push({ sheet, key, value, row, index });
+        }
+      }
+    }
+  }
+  const shortFollowUp = /^(?:what|which|how|and|(?:i(?:'m| am) asking))\b/i.test(q.trim()) &&
+    q.trim().split(/\s+/).length <= 12 &&
+    !/\b(?:total|sum|count|average|how many|compare|difference)\b/i.test(q);
+  if (!candidates.length && !identifiers.length && !rowNumber && shortFollowUp && context.lastRecord) {
+    const previous = context.lastRecord;
+    const data = reportData?.[previous.sheet];
+    const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+    const index = rows.findIndex((row) => String(row?.[previous.key] ?? '').trim() === previous.value);
+    if (index >= 0) return { ...previous, row: rows[index], index };
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function recordFieldAnswer(record, question) {
+  if (!record) return null;
+  const q = String(question).toLowerCase();
+  const stop = new Set(['what', 'which', 'where', 'how', 'about', 'this', 'that', 'his', 'her', 'its',
+    'the', 'of', 'for', 'in', 'and', 'please', 'tell', 'me', 'source', 'row', 'number', 'no', 'position']);
+  const terms = [...new Set(normalizedHeader(q).split(' ').filter((word) => word.length > 1 && !stop.has(word)))];
+  const columns = Object.keys(record.row || {}).filter((key) => key !== record.key);
+  const scored = columns.map((key) => {
+    const words = normalizedHeader(key).split(' ').filter((word) => word.length > 1 && !stop.has(word));
+    return { key, words, score: words.filter((word) => terms.includes(word)).length };
+  }).filter((item) => item.score && item.score === item.words.length);
+  scored.sort((a, b) => b.score - a.score);
+  if (!scored.length) return null;
+  const best = scored[0].score;
+  const chosen = scored.filter((item) => item.score === best &&
+    (!/\bactual\b/.test(q) || /\bactual\b/.test(normalizedHeader(item.key))));
+  if (!chosen.length || chosen.length > 3) return null;
+  const phrases = chosen.map(({ key }) => `${normalizedHeader(key)} is ${String(record.row[key] ?? '').trim()}`);
+  if (phrases.some((part) => !part.split(' is ')[1])) return null;
+  return `${record.value}: ${phrases.join('; ')}.`;
+}
+
 function metricTokens(value) {
   return String(value).replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
     .split(/[^a-z0-9]+/).filter(Boolean)
@@ -344,12 +407,17 @@ async function answerQuestion(reportData, question, conversationKey) {
         .slice(-MAX_HISTORY_MESSAGES).map((item) => ({ role: item.role, content: item.content.slice(0, 1000) }))
     : [];
   const resolvedQuestion = resolveFollowUp(reportData, question, context.lastQuestion);
+  const record = findRecord(reportData, question, context);
   const finish = (answer) => {
+    if (record) context.lastRecord = { sheet: record.sheet, key: record.key, value: record.value };
     context.history = [...history, { role: "user", content: String(question).slice(0, 1000) },
       { role: "assistant", content: String(answer).slice(0, 1000) }].slice(-MAX_HISTORY_MESSAGES);
     context.lastQuestion = String(resolvedQuestion).slice(0, 1000);
     return { success: true, answer };
   };
+
+  const fieldAnswer = recordFieldAnswer(record, question);
+  if (fieldAnswer) return finish(fieldAnswer);
 
   const numericAnswer = exactNumericTotal(reportData, question, context);
   if (numericAnswer) {
