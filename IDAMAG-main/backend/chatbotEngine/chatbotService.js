@@ -54,6 +54,8 @@ function findRecord(reportData, question, context) {
   const identifiers = [...new Set(q.match(/\b(?=[a-z0-9-]*\d)[a-z0-9]+(?:-[a-z0-9]+)+\b/gi) || [])];
   const rowNumber = q.match(/\b(?:source\s+)?row\s*(?:number|no\.?|#)\s*(\d+)\b/i)?.[1];
   const candidates = [];
+  const named = [];
+  const questionWords = normalizedHeader(q);
   for (const [sheet, data] of Object.entries(reportData || {})) {
     if (data?.error) continue;
     const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
@@ -68,8 +70,29 @@ function findRecord(reportData, question, context) {
             (rowNumber && rowKeys.includes(key) && value === rowNumber)) {
           candidates.push({ sheet, key, value, row, index });
         }
+        // Names can be written surname-first in a cell and given-name-first
+        // in a question. Accept a unique sequence of at least two name words.
+        if (!identifiers.length && !rowNumber && /\b(?:name|incumbent)\b/.test(normalizedHeader(key))) {
+          const words = normalizedHeader(value).split(' ').filter(Boolean);
+          if (words.length >= 2 && words.length <= 8) {
+            let longest = 0;
+            for (let start = 0; start < words.length - 1; start++) {
+              for (let end = start + 2; end <= words.length; end++) {
+                const phrase = words.slice(start, end).join(' ');
+                if (phrase.length >= 8 && ` ${questionWords} `.includes(` ${phrase} `))
+                  longest = Math.max(longest, end - start);
+              }
+            }
+            if (longest) named.push({ sheet, key, value, row, index, score: longest });
+          }
+        }
       }
     }
+  }
+  if (candidates.length) return candidates.length === 1 ? candidates[0] : null;
+  if (!identifiers.length && !rowNumber && named.length) {
+    named.sort((a, b) => b.score - a.score);
+    return named.filter((item) => item.score === named[0].score).length === 1 ? named[0] : null;
   }
   const shortFollowUp = /^(?:what|which|how|and|(?:i(?:'m| am) asking))\b/i.test(q.trim()) &&
     q.trim().split(/\s+/).length <= 12 &&
@@ -81,7 +104,7 @@ function findRecord(reportData, question, context) {
     const index = rows.findIndex((row) => String(row?.[previous.key] ?? '').trim() === previous.value);
     if (index >= 0) return { ...previous, row: rows[index], index };
   }
-  return candidates.length === 1 ? candidates[0] : null;
+  return null;
 }
 
 function recordFieldAnswer(record, question) {
@@ -416,7 +439,9 @@ async function answerQuestion(reportData, question, conversationKey) {
     return { success: true, answer };
   };
 
-  const fieldAnswer = recordFieldAnswer(record, question);
+  const fieldQuestion = /^of\s+[\p{L}\s,.'-]+\??$/iu.test(String(question).trim()) &&
+    context.lastQuestion ? context.lastQuestion : question;
+  const fieldAnswer = recordFieldAnswer(record, fieldQuestion);
   if (fieldAnswer) return finish(fieldAnswer);
 
   const numericAnswer = exactNumericTotal(reportData, question, context);
