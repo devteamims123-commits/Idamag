@@ -312,7 +312,7 @@ function exactCategoryDifference(reportData, question) {
   const secondCount = rows.filter((row) => clean(row[groupKey]) === second.toLowerCase() && clean(row[statusKey]) === category).length;
   const noun = /\bpositions?\b/i.test(question) ? 'position' : 'record';
   const difference = Math.abs(firstCount - secondCount);
-  return `${first.toUpperCase()} has ${firstCount} ${category} ${noun}${firstCount === 1 ? '' : 's'}, and ${second.toUpperCase()} has ${secondCount}. That's a difference of ${difference} ${noun}${difference === 1 ? '' : 's'}.`;
+  return `${first.toUpperCase()}: ${firstCount} ${category} ${noun}${firstCount === 1 ? '' : 's'}; ${second.toUpperCase()}: ${secondCount}. Difference: ${difference} ${noun}${difference === 1 ? '' : 's'}.`;
 }
 
 function resolveFollowUp(reportData, question, previousQuestion) {
@@ -367,7 +367,7 @@ function executePlan(reportData, plan, question = '') {
       if (!groups.has(group)) groups.set(group, []);
       groups.get(group).push(row);
     }
-    const results = [...groups.entries()].map(([group, items]) => {
+    let results = [...groups.entries()].map(([group, items]) => {
       if (query.operation === 'count') return { group, value: items.length };
       if (!query.column) throw new Error("A numeric calculation needs a selected column.");
       const values = items.map((item) => numberValue(item[query.column]));
@@ -378,15 +378,51 @@ function executePlan(reportData, plan, question = '') {
       return { group, value: Number(value.toFixed(4)) };
     });
     if (!query.groupBy && !results.length && query.operation === 'count') results.push({ group: 'all', value: 0 });
-    if (!results.length || results.length > 30) throw new Error("The answer could not be shown reliably from the selected rows.");
     if (query.groupBy) {
       const noun = /\bpositions?\b/i.test(question) ? 'position' : 'record';
-      const parts = results.map(({ group, value }) => query.operation === 'count'
-        ? `${value} ${group} ${noun}${value === 1 ? '' : 's'}` : `${group}: ${value}`);
-      answers.push(query.operation === 'count' ? `I found ${parts.join(' and ')}.` : `The ${query.operation} values are ${parts.join(', ')}.`);
+      const text = ` ${String(question).toLowerCase()} `;
+      const mentioned = [...new Set(rows.map((row) => String(row[query.groupBy] ?? '').trim()).filter(Boolean))]
+        .filter((group) => {
+          const value = group.toLowerCase();
+          let index = text.indexOf(value);
+          while (index >= 0) {
+            const end = index + value.length;
+            if (!/[\p{L}\p{N}]/u.test(text[index - 1] || '') &&
+                !/[\p{L}\p{N}]/u.test(text[end] || '')) return true;
+            index = text.indexOf(value, index + 1);
+          }
+          return false;
+        });
+      if (mentioned.length && query.operation === 'count') {
+        results = mentioned.map((group) => ({ group,
+          value: results.find((item) => item.group.toLowerCase() === group.toLowerCase())?.value || 0 }));
+      } else if (mentioned.length) {
+        results = results.filter((item) => mentioned.some((group) => group.toLowerCase() === item.group.toLowerCase()));
+      }
+      if (!results.length || results.length > 30) throw new Error("The answer could not be shown reliably from the selected rows.");
+      const rateQuestion = /\b(?:percent|percentage|rate)\b/i.test(question);
+      if (rateQuestion && query.operation === 'count') {
+        results = results.map(({ group, value }) => ({ group, value,
+          total: rows.filter((row) => String(row[query.groupBy] ?? '').trim().toLowerCase() === group.toLowerCase()).length }));
+      }
+      const highest = /\b(?:most|highest|largest|greatest)\b/i.test(question);
+      const lowest = /\b(?:fewest|lowest|smallest|least)\b/i.test(question);
+      if ((highest || lowest) && results.length > 1) {
+        const measure = (item) => rateQuestion && item.total ? item.value / item.total : item.value;
+        const target = (highest ? Math.max : Math.min)(...results.map(measure));
+        results = results.filter((item) => measure(item) === target);
+      }
+      const label = query.filters.length === 1 && query.filters[0].operator === 'equals'
+        ? `${query.filters[0].value.trim().toLowerCase()} ` : '';
+      const parts = results.map(({ group, value, total }) => rateQuestion && query.operation === 'count'
+        ? `${group}: ${total ? (100 * value / total).toFixed(2) : '0.00'}% (${value} of ${total} ${noun}${total === 1 ? '' : 's'})`
+        : query.operation === 'count' ? `${group}: ${value} ${label}${noun}${value === 1 ? '' : 's'}`
+        : `${group}: ${value.toLocaleString('en-US')}`);
+      answers.push(`${parts.join('; ')}.`);
     } else if (query.operation === 'count') {
-      answers.push(`I found ${results[0].value} matching records.`);
+      answers.push(`${results[0].value.toLocaleString('en-US')} ${/\bpositions?\b/i.test(question) ? 'positions' : 'matching records'}.`);
     } else {
+      if (!results.length) throw new Error("The answer could not be shown reliably from the selected rows.");
       const measure = String(query.column).replace(/[_-]/g, ' ').replace(/\bcount\b/gi, '').trim();
       answers.push(`The ${query.operation === 'sum' ? 'total' : query.operation} ${measure} is ${results[0].value.toLocaleString('en-US')}.`);
     }
@@ -437,7 +473,7 @@ async function calculateFromAllRows(reportData, question, apiKey, history = []) 
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: process.env.OLLAMA_MODEL || DEFAULT_MODEL, stream: false, think: false,
         format: 'json', messages: [
-          { role: 'system', content: `Translate the user's quantitative question into a calculation plan for the provided worksheets. Return JSON only: {"queries":[{"sheet":"exact worksheet name","operation":"count|sum|average|minimum|maximum","column":null,"groupBy":null,"filters":[{"column":"exact column name","operator":"equals|contains","value":"exact observed cell value"}]}]}. Use one grouped count for questions asking for categories such as filled and unfilled. For a filtered count, choose the column whose examples contain the requested value. Use only exact worksheet names, column names and category values from the schema. For count, column is null unless counting only nonempty values in that column. Use equals for categorical filters. When ambiguous or unsupported return {"queries":[]}. Do not include an answer or executable code.` },
+          { role: 'system', content: `Translate the user's quantitative question into a calculation plan for the provided worksheets. Return JSON only: {"queries":[{"sheet":"exact worksheet name","operation":"count|sum|average|minimum|maximum","column":null,"groupBy":null,"filters":[{"column":"exact column name","operator":"equals|contains","value":"exact observed cell value"}]}]}. Use one grouped count for questions asking for categories such as filled and unfilled. For questions comparing groups or asking which group has the most, use groupBy for the relevant column and filter the category being counted; the server selects the requested groups or winner. For a filtered count, choose the column whose examples contain the requested value. Use only exact worksheet names, column names and category values from the schema. For count, column is null unless counting only nonempty values in that column. Use equals for categorical filters. When ambiguous or unsupported return {"queries":[]}. Do not include an answer or executable code.` },
           { role: 'user', content: `Recent conversation: ${JSON.stringify(history.slice(-4)).slice(0, 3000)}\nQuestion: ${String(question).slice(0, 1200)}\nWorksheet schema and example values: ${JSON.stringify(describeSheets(reportData)).slice(0, 24000)}` },
         ] }), signal: controller.signal,
     });
@@ -505,7 +541,7 @@ async function answerQuestion(reportData, question, conversationKey) {
     throw Object.assign(new Error("OLLAMA_API_KEY is not configured on the backend."), { statusCode: 503 });
   }
 
-  if (/\b(?:how many|count|total|sum|average|mean|minimum|maximum|highest|lowest)\b/i.test(String(resolvedQuestion))) {
+  if (/\b(?:how many|count|total|sum|average|mean|minimum|maximum|highest|lowest|most|fewest|largest|smallest|percent|percentage|rate|difference)\b/i.test(String(resolvedQuestion))) {
     return finish(await calculateFromAllRows(reportData, resolvedQuestion, apiKey, history));
   }
 
