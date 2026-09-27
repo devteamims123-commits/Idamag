@@ -219,7 +219,7 @@ function exactGroupRate(reportData, question) {
 }
 
 function exactExtremumRecord(reportData, question) {
-  const match = String(question).trim().match(/^which\s+([a-z][a-z-]*)\s+has\s+(?:the\s+)?(highest|lowest|largest|smallest|maximum|minimum)\s+(.+?)\s*\??$/i);
+  const match = String(question).trim().match(/^which\s+([a-z][a-z -]*?)\s+has\s+(?:the\s+)?(highest|lowest|largest|smallest|maximum|minimum)\s+(.+?)\s*\??$/i);
   if (!match) return null;
   const [, subject, direction, measure] = match;
   const noun = normalizedHeader(subject).replace(/ies$/, 'y').replace(/s$/, '');
@@ -234,7 +234,7 @@ function exactExtremumRecord(reportData, question) {
     if (metricKeys.length !== 1) continue;
     const entityKeys = keys.filter((key) => {
       const words = normalizedHeader(key).split(' ');
-      return normalizedHeader(key) === noun || words.includes(noun) &&
+      return normalizedHeader(key) === noun || !noun.includes(' ') && words.includes(noun) &&
         words.some((word) => ['title', 'name'].includes(word));
     });
     if (entityKeys.length !== 1) continue;
@@ -255,6 +255,47 @@ function exactExtremumRecord(reportData, question) {
     /\.\d{2}$/.test(String(sample).trim()) ? 2 : 0;
   const amount = extreme.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
   return `${leaders.join(', ')} ${leaders.length === 1 ? 'has' : 'have'} the ${direction.toLowerCase()} ${normalizedHeader(metricKey)}: ${amount}.`;
+}
+
+function exactValueDifference(reportData, question) {
+  const match = String(question).trim().match(/^what(?:'s| is)\s+(?:the\s+)?(.+?)\s+difference\s+between\s+(.+?)\s+and\s+(.+?)\s*\??$/i);
+  if (!match) return null;
+  const [, measure, first, second] = match;
+  const normalize = (value) => normalizedHeader(value);
+  const metricWords = normalize(measure).split(' ');
+  const candidates = [];
+  for (const [sheetName, data] of Object.entries(reportData || {})) {
+    if (data?.error) return null;
+    const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+    if (!rows.length) continue;
+    const keys = Object.keys(rows[0] || {});
+    for (const entityKey of keys) {
+      const a = rows.filter((row) => normalize(row[entityKey]) === normalize(first));
+      const b = rows.filter((row) => normalize(row[entityKey]) === normalize(second));
+      if (!a.length || !b.length) continue;
+      for (const metricKey of keys.filter((key) => key !== entityKey &&
+        metricWords.every((word) => normalize(key).split(' ').includes(word)))) {
+        const valuesA = [...new Set(a.map((row) => numberValue(row[metricKey])))];
+        const valuesB = [...new Set(b.map((row) => numberValue(row[metricKey])))];
+        if (valuesA.length !== 1 || valuesB.length !== 1 ||
+            valuesA[0] === null || valuesB[0] === null) continue;
+        candidates.push({ sheetName, entityKey, metricKey,
+          firstLabel: String(a[0][entityKey]).trim(), secondLabel: String(b[0][entityKey]).trim(),
+          firstValue: valuesA[0], secondValue: valuesB[0] });
+      }
+    }
+  }
+  if (!candidates.length) return null;
+  if (new Set(candidates.map((item) => `${item.firstValue}:${item.secondValue}`)).size !== 1)
+    return `Do you mean actual or authorized ${normalize(measure)}?`;
+  const { firstLabel, secondLabel, firstValue, secondValue } = candidates[0];
+  const difference = Math.abs(firstValue - secondValue).toLocaleString('en-US',
+    { minimumFractionDigits: /\b(?:salary|price|amount|cost|pay|wage)\b/.test(normalize(measure)) ? 2 : 0,
+      maximumFractionDigits: 2 });
+  if (firstValue === secondValue) return `${firstLabel} and ${secondLabel} have the same ${normalize(measure)}.`;
+  const higher = firstValue > secondValue ? firstLabel : secondLabel;
+  const lower = firstValue > secondValue ? secondLabel : firstLabel;
+  return `${higher}'s ${normalize(measure)} is ${difference} higher than ${lower}'s.`;
 }
 
 function metricTokens(value) {
@@ -655,6 +696,8 @@ async function answerQuestion(reportData, question, conversationKey) {
 
   const extremeAnswer = exactExtremumRecord(reportData, question);
   if (extremeAnswer) return finish(extremeAnswer);
+  const valueDifference = exactValueDifference(reportData, question);
+  if (valueDifference) return finish(valueDifference);
 
   const fieldQuestion = /^of\s+[\p{L}\s,.'-]+\??$/iu.test(String(question).trim()) &&
     context.lastQuestion ? context.lastQuestion : question;
