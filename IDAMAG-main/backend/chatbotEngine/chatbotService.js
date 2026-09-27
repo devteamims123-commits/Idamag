@@ -168,6 +168,56 @@ function distinctValueAnswer(reportData, question, context) {
   return { answer: `There are ${count} ${noun}: ${list}.${rest}`, subject };
 }
 
+function exactGroupRate(reportData, question) {
+  const match = String(question).trim().match(/^which\s+([a-z][a-z-]*)\s+has\s+(?:the\s+)?(highest|lowest|greatest|smallest)\s+(?:percentage|percent|rate)\s+of\s+(.+?)\s*\??$/i);
+  if (!match) return null;
+  const [, groupName, direction, categoryText] = match;
+  const groupHeader = normalizedHeader(groupName).replace(/ies$/, 'y').replace(/s$/, '');
+  const subject = ` ${normalizedHeader(categoryText)} `;
+  const matches = [];
+  for (const [sheetName, data] of Object.entries(reportData || {})) {
+    if (data?.error) return null;
+    const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+    if (!rows.length) continue;
+    const keys = Object.keys(rows[0] || {});
+    const groupKeys = keys.filter((key) => normalizedHeader(key) === groupHeader);
+    if (groupKeys.length !== 1) continue;
+    const groupKey = groupKeys[0];
+    const options = [];
+    for (const key of keys.filter((item) => item !== groupKey)) {
+      for (const row of rows) {
+        const value = String(row[key] ?? '').trim();
+        const label = normalizedHeader(value);
+        if (label.length >= 3 && subject.includes(` ${label} `) &&
+            !options.some((item) => item.key === key && item.label === label))
+          options.push({ key, value, label });
+      }
+    }
+    options.sort((a, b) => b.label.length - a.label.length);
+    if (!options.length || (options[1] && options[0].label.length === options[1].label.length)) continue;
+    const { key, value, label } = options[0];
+    const groups = new Map();
+    for (const row of rows) {
+      const group = String(row[groupKey] ?? '').trim();
+      if (!group) continue;
+      const id = group.toLowerCase();
+      if (!groups.has(id)) groups.set(id, { group, total: 0, count: 0 });
+      const item = groups.get(id);
+      item.total++;
+      if (normalizedHeader(row[key]) === label) item.count++;
+    }
+    if (groups.size) matches.push({ sheetName, value, groups: [...groups.values()] });
+  }
+  if (matches.length !== 1) return null;
+  const { value, groups } = matches[0];
+  const ranked = groups.sort((a, b) => (a.count / a.total - b.count / b.total) *
+    (/^(highest|greatest)$/i.test(direction) ? -1 : 1));
+  const winner = ranked[0];
+  if (!winner || (ranked[1] && winner.count * ranked[1].total === ranked[1].count * winner.total)) return null;
+  const noun = /\bpositions?\b/i.test(question) ? 'positions' : 'records';
+  return `${winner.group}: ${(winner.count / winner.total * 100).toFixed(2)}% ${value.toLowerCase()} (${winner.count} of ${winner.total} ${noun}).`;
+}
+
 function metricTokens(value) {
   return String(value).replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
     .split(/[^a-z0-9]+/).filter(Boolean)
@@ -527,6 +577,9 @@ async function answerQuestion(reportData, question, conversationKey) {
     if (listAnswer.subject) context.lastListQuery = listAnswer.subject;
     return finish(listAnswer.answer);
   }
+
+  const rateAnswer = exactGroupRate(reportData, question);
+  if (rateAnswer) return finish(rateAnswer);
 
   const numericAnswer = exactNumericTotal(reportData, question, context);
   if (numericAnswer) {
