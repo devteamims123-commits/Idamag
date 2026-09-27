@@ -289,6 +289,51 @@ function exactNumericTotal(reportData, question, context) {
     state: { sheet: result.sheet, column: result.column, scopeKey: result.scopeKey, scopeValue: result.scopeValue } };
 }
 
+function exactSubjectStatusCounts(reportData, question, context) {
+  const input = String(question).trim();
+  const initial = input.match(/^(?:how many|count)\s+(.+?)\s+(positions?|records?|entries|items)\s+(?:(?:are|were|is)\s+)?(.+?)\s*\??$/i);
+  const followUp = !initial && context.lastStatusQuery &&
+    input.match(/^(?:in|for|what about(?: in)?)\s+(.+?)\s*\??$/i);
+  if (!initial && !followUp) return null;
+  const normalize = (value) => normalizedHeader(value);
+  const subject = normalize(initial ? initial[1].replace(/^the\s+/i, '') : followUp[1]);
+  const matches = [];
+  for (const [sheetName, data] of Object.entries(reportData || {})) {
+    if (data?.error) continue;
+    const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+    if (!rows.length) continue;
+    const keys = Object.keys(rows[0] || {});
+    for (const subjectKey of keys) {
+      const subset = rows.filter((row) => normalize(row[subjectKey]) === subject);
+      if (!subset.length) continue;
+      for (const statusKey of keys.filter((key) => key !== subjectKey)) {
+        const labels = initial
+          ? [...new Set(rows.map((row) => String(row[statusKey] ?? '').trim()).filter(Boolean))]
+              .filter((value) => {
+                const label = normalize(value);
+                return label.length >= 3 && ` ${normalize(initial[3])} `.includes(` ${label} `);
+              })
+          : context.lastStatusQuery.sheet === sheetName &&
+              context.lastStatusQuery.subjectKey === subjectKey &&
+              context.lastStatusQuery.statusKey === statusKey
+                ? context.lastStatusQuery.labels : [];
+        if (!labels.length || labels.length > 4) continue;
+        const counts = labels.map((value) => ({ value,
+          count: subset.filter((row) => normalize(row[statusKey]) === normalize(value)).length }));
+        matches.push({ sheet: sheetName, subjectKey, statusKey, subjectValue: subset[0][subjectKey], labels, counts });
+      }
+    }
+  }
+  if (matches.length !== 1) return null;
+  const match = matches[0];
+  const parts = match.counts.map(({ value, count }) => `${count} ${value.toLowerCase()}`);
+  const form = initial ? initial[2].toLowerCase() : context.lastStatusQuery.noun;
+  const noun = form.endsWith('ies') ? `${form.slice(0, -3)}y` : form.replace(/s$/, '');
+  const total = match.counts.reduce((sum, item) => sum + item.count, 0);
+  return { answer: `${String(match.subjectValue).trim()}: ${parts.join(', ')} ${total === 1 ? noun : noun.endsWith('y') ? `${noun.slice(0, -1)}ies` : `${noun}s`}.`,
+    state: { sheet: match.sheet, subjectKey: match.subjectKey, statusKey: match.statusKey, labels: match.labels, noun } };
+}
+
 // Answer simple categorical counts directly from all cells. Column names and
 // category labels come from the selected worksheet and the user's question.
 function exactCategoryCount(reportData, question) {
@@ -585,6 +630,12 @@ async function answerQuestion(reportData, question, conversationKey) {
   if (numericAnswer) {
     context.lastNumericQuery = numericAnswer.state;
     return finish(numericAnswer.answer);
+  }
+
+  const statusAnswer = exactSubjectStatusCounts(reportData, question, context);
+  if (statusAnswer) {
+    context.lastStatusQuery = statusAnswer.state;
+    return finish(statusAnswer.answer);
   }
 
   const directAnswer = exactCategoryDifference(reportData, resolvedQuestion) || exactCategoryCount(reportData, resolvedQuestion);
