@@ -96,7 +96,7 @@ function findRecord(reportData, question, context) {
   }
   const shortFollowUp = /^(?:what|which|how|and|(?:i(?:'m| am) asking))\b/i.test(q.trim()) &&
     q.trim().split(/\s+/).length <= 12 &&
-    !/\b(?:total|sum|count|average|how many|compare|difference)\b/i.test(q);
+    !/\b(?:total|sum|count|average|how many|compare|difference|highest|lowest|largest|smallest|maximum|minimum|most|fewest)\b/i.test(q);
   if (!candidates.length && !identifiers.length && !rowNumber && shortFollowUp && context.lastRecord) {
     const previous = context.lastRecord;
     const data = reportData?.[previous.sheet];
@@ -216,6 +216,45 @@ function exactGroupRate(reportData, question) {
   if (!winner || (ranked[1] && winner.count * ranked[1].total === ranked[1].count * winner.total)) return null;
   const noun = /\bpositions?\b/i.test(question) ? 'positions' : 'records';
   return `${winner.group}: ${(winner.count / winner.total * 100).toFixed(2)}% ${value.toLowerCase()} (${winner.count} of ${winner.total} ${noun}).`;
+}
+
+function exactExtremumRecord(reportData, question) {
+  const match = String(question).trim().match(/^which\s+([a-z][a-z-]*)\s+has\s+(?:the\s+)?(highest|lowest|largest|smallest|maximum|minimum)\s+(.+?)\s*\??$/i);
+  if (!match) return null;
+  const [, subject, direction, measure] = match;
+  const noun = normalizedHeader(subject).replace(/ies$/, 'y').replace(/s$/, '');
+  const metric = normalizedHeader(measure);
+  const candidates = [];
+  for (const [sheetName, data] of Object.entries(reportData || {})) {
+    if (data?.error) return null;
+    const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+    if (!rows.length) continue;
+    const keys = Object.keys(rows[0] || {});
+    const metricKeys = keys.filter((key) => normalizedHeader(key) === metric);
+    if (metricKeys.length !== 1) continue;
+    const entityKeys = keys.filter((key) => {
+      const words = normalizedHeader(key).split(' ');
+      return normalizedHeader(key) === noun || words.includes(noun) &&
+        words.some((word) => ['title', 'name'].includes(word));
+    });
+    if (entityKeys.length !== 1) continue;
+    const metricKey = metricKeys[0], entityKey = entityKeys[0];
+    const values = rows.map((row) => ({ row, value: numberValue(row[metricKey]) }))
+      .filter(({ row, value }) => value !== null && String(row[entityKey] ?? '').trim());
+    if (values.length) candidates.push({ sheetName, metricKey, entityKey, values });
+  }
+  if (candidates.length !== 1) return null;
+  const { metricKey, entityKey, values } = candidates[0];
+  const highest = /^(highest|largest|maximum)$/i.test(direction);
+  const extreme = (highest ? Math.max : Math.min)(...values.map((item) => item.value));
+  const leaders = [...new Set(values.filter((item) => item.value === extreme)
+    .map((item) => String(item.row[entityKey]).trim()))];
+  if (!leaders.length || leaders.length > 3) return null;
+  const sample = values.find((item) => item.value === extreme).row[metricKey];
+  const decimals = /\b(?:salary|price|amount|cost|pay|wage)\b/.test(normalizedHeader(metricKey)) ||
+    /\.\d{2}$/.test(String(sample).trim()) ? 2 : 0;
+  const amount = extreme.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  return `${leaders.join(', ')} ${leaders.length === 1 ? 'has' : 'have'} the ${direction.toLowerCase()} ${normalizedHeader(metricKey)}: ${amount}.`;
 }
 
 function metricTokens(value) {
@@ -590,7 +629,10 @@ async function calculateFromAllRows(reportData, question, apiKey, history = []) 
     return "I couldn't determine a reliable calculation for that question.";
   }
   try { return executePlan(reportData, plan, question); }
-  catch (error) { return `I couldn't verify an exact answer: ${error.message}`; }
+  catch (error) {
+    console.warn('Chatbot calculation plan rejected:', error.message);
+    return "I couldn't confirm that answer from the connected data.";
+  }
 }
 
 async function answerQuestion(reportData, question, conversationKey) {
@@ -610,6 +652,9 @@ async function answerQuestion(reportData, question, conversationKey) {
     context.lastQuestion = String(resolvedQuestion).slice(0, 1000);
     return { success: true, answer };
   };
+
+  const extremeAnswer = exactExtremumRecord(reportData, question);
+  if (extremeAnswer) return finish(extremeAnswer);
 
   const fieldQuestion = /^of\s+[\p{L}\s,.'-]+\??$/iu.test(String(question).trim()) &&
     context.lastQuestion ? context.lastQuestion : question;
