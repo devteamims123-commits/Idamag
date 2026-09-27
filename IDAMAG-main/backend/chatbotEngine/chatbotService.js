@@ -129,6 +129,45 @@ function recordFieldAnswer(record, question) {
   return `${record.value}: ${phrases.join('; ')}.`;
 }
 
+// Enumerate distinct values from all loaded rows, rather than asking the
+// language model to infer a complete list from the small evidence excerpt.
+function distinctValueAnswer(reportData, question, context) {
+  const input = String(question).trim();
+  const followUp = /^(?:(?:[a-z]+|\d+)\s+)?(?:only|just)\s*\??$/i.test(input);
+  const listMatch = input.match(/^(?:(?:what|which)\s+are|(?:list|show|name))\s+(?:me\s+)?(?:all\s+)?(?:the\s+)?([a-z][a-z-]*)\s*\??$/i);
+  const countMatch = input.match(/^how\s+many\s+(?:(?:different|distinct|unique)\s+)?([a-z][a-z-]*)\s+(?:are\s+there|do\s+we\s+have)\s*\??$/i);
+  const subject = followUp ? context.lastListQuery : listMatch?.[1] || countMatch?.[1];
+  if (!subject) return null;
+  const normalized = normalizedHeader(subject).replace(/ies$/, 'y').replace(/s$/, '');
+  const matches = [];
+  for (const [sheetName, data] of Object.entries(reportData || {})) {
+    if (data?.error) continue;
+    const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
+    if (!rows.length) continue;
+    const keys = Object.keys(rows[0] || {}).filter((key) => normalizedHeader(key) === normalized);
+    if (keys.length === 1) matches.push({ sheetName, rows, key: keys[0] });
+  }
+  if (!matches.length) return null;
+  if (Object.values(reportData || {}).some((data) => data?.error))
+    return { answer: 'I cannot confirm the complete list because some connected sheets could not be read.' };
+  const values = new Map();
+  for (const { rows, key } of matches) {
+    for (const row of rows) {
+      const value = String(row[key] ?? '').trim();
+      if (value && !values.has(value.toLowerCase())) values.set(value.toLowerCase(), value);
+    }
+  }
+  const items = [...values.values()].sort((a, b) => a.localeCompare(b));
+  const count = items.length;
+  const noun = subject.toLowerCase();
+  if (countMatch) return { answer: `There are ${count} distinct ${noun}.`, subject };
+  if (!count) return { answer: `I found no ${noun} in the connected data.`, subject };
+  const shown = items.slice(0, 40);
+  const list = shown.join(', ');
+  const rest = count > shown.length ? ` I listed the first ${shown.length}.` : '';
+  return { answer: `There are ${count} ${noun}: ${list}.${rest}`, subject };
+}
+
 function metricTokens(value) {
   return String(value).replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
     .split(/[^a-z0-9]+/).filter(Boolean)
@@ -431,8 +470,10 @@ async function answerQuestion(reportData, question, conversationKey) {
     : [];
   const resolvedQuestion = resolveFollowUp(reportData, question, context.lastQuestion);
   const record = findRecord(reportData, question, context);
+  let listed = false;
   const finish = (answer) => {
     if (record) context.lastRecord = { sheet: record.sheet, key: record.key, value: record.value };
+    if (!listed) context.lastListQuery = null;
     context.history = [...history, { role: "user", content: String(question).slice(0, 1000) },
       { role: "assistant", content: String(answer).slice(0, 1000) }].slice(-MAX_HISTORY_MESSAGES);
     context.lastQuestion = String(resolvedQuestion).slice(0, 1000);
@@ -443,6 +484,13 @@ async function answerQuestion(reportData, question, conversationKey) {
     context.lastQuestion ? context.lastQuestion : question;
   const fieldAnswer = recordFieldAnswer(record, fieldQuestion);
   if (fieldAnswer) return finish(fieldAnswer);
+
+  const listAnswer = distinctValueAnswer(reportData, question, context);
+  if (listAnswer) {
+    listed = true;
+    if (listAnswer.subject) context.lastListQuery = listAnswer.subject;
+    return finish(listAnswer.answer);
+  }
 
   const numericAnswer = exactNumericTotal(reportData, question, context);
   if (numericAnswer) {
